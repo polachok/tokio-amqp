@@ -1,0 +1,9 @@
+[package]
+name = "tokio-amqp"
+version = "0.1.0"
+authors = ["Alexander Polyakov <apolyakov@beget.com>"]
+
+[dependencies]
+amqp = { git = "https://github.com/polachok/rust-amqp", branch = "public" }
+tokio-core = "0.1.1"
+futures = "0.1.6"
