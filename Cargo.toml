@@ -4,6 +4,6 @@ version = "0.1.0"
 authors = ["Alexander Polyakov <apolyakov@beget.com>"]
 
 [dependencies]
-amqp = { git = "https://github.com/polachok/rust-amqp", branch = "public" }
+amqp = { git = "https://github.com/polachok/rust-amqp", branch = "public", default-features = false }
 tokio-core = "0.1.1"
 futures = "0.1.6"
