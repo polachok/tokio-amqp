@@ -1,6 +1,7 @@
 extern crate tokio_core;
 extern crate futures;
 extern crate amqp;
+extern crate tokio_proto;
 
 use tokio_core::net::{TcpStream,TcpStreamNew};
 use tokio_core::reactor::Core;
@@ -13,12 +14,45 @@ use std::io::{Read,Write,Cursor};
 use futures::{Future,Stream,Sink};
 use amqp::protocol::{self, Frame, FrameType, MethodFrame, Method};
 use amqp::AMQPError;
+use tokio_proto::multiplex::ClientProto;
+
+struct AmqpClient { }
+
+impl ClientProto<TcpStream> for AmqpClient {
+    type Request = Frame;
+    type Response = Frame;
+    type Error = amqp::AMQPError;
+    type Transport = AmqpStream<TcpStream>;
+    type BindTransport = Result<AmqpStream<TcpStream>, std::io::Error>;
+    fn bind_transport(&self, io: TcpStream) -> Self::BindTransport {
+        //AmqpStreamNew { tcp: io }
+        /*
+        const bytes: [u8; 8] = [b'A', b'M', b'Q', b'P', 0, 0, 9, 1];
+        let f = tokio_core::io::write_all(io, &bytes)
+                    .and_then(move |(tcp, _)| Ok(AmqpStream {
+                        inner: tcp.framed(AmqpCodec {}),
+                        frame_max_limit: 131072,
+                        channel_max_limit: 65535,
+                        channels: Vec::new(),
+                    }));
+        Box::new(f)
+                    */
+        //Ok(AmqpStream { inner: io.framed(AmqpCodec {}) })
+        Ok(AmqpStream {
+                        inner: io.framed(AmqpCodec {}),
+                        frame_max_limit: 131072,
+                        channel_max_limit: 65535,
+                        channels: Vec::new(),
+                    })
+    }
+}
+
 
 struct AmqpCodec { }
 
 impl Codec for AmqpCodec {
-    type In = Frame;
-    type Out = Frame;
+    type In = (u64, Frame);
+    type Out = (u64, Frame);
 
     fn decode(&mut self, buf: &mut EasyBuf) -> Result<Option<Self::In>, std::io::Error> {
         //println!("DECODING {:?}", buf.as_slice());
@@ -27,14 +61,17 @@ impl Codec for AmqpCodec {
             if let Some(pos) = bytes.iter().position(|b| *b == 0xce) {
                 let mut c = Cursor::new(&bytes[0..pos+1]);
                 let f = Frame::decode(&mut c).ok();
-                if let Some(ref f) = f {
+                if let Some(f) = f {
                     //println!("FRAME {:?}", f);
-                    let mf = MethodFrame::decode(&f).unwrap();
+                    //let mf = MethodFrame::decode(&f).unwrap();
                     //println!("METHOD FRAME {:?} name: {}", mf, mf.method_name());
                     //let met: protocol::connection::Start = Method::decode(mf).unwrap();
                     //println!("METHOD {:?}", met);
+                    Some((pos, Some((f.channel as u64, f))))
+                } else {
+                    None
                 }
-                Some((pos, f))
+                //Some((pos, f))
             } else {
                 //println!("NOTHING IN HERE");
                 None
@@ -42,13 +79,13 @@ impl Codec for AmqpCodec {
         };
         if let Some((pos, f)) = used {
             buf.drain_to(pos+1);
-            return Ok(f);
+            return Ok(f)
         }
         Ok(None)
     }
 
     fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> std::io::Result<()> {
-        let mut v = msg.encode().unwrap();
+        let mut v = msg.1.encode().unwrap();
         buf.append(&mut v);
         Ok(())
     }
@@ -116,8 +153,9 @@ struct AmqpStream<T: tokio_core::io::Io> {
     channels: Vec<Channel>,
 }
 
+/*
 struct AmqpStreamNew {
-    tcp: TcpStreamNew,
+    tcp: TcpStream,
 }
 
 impl Future for AmqpStreamNew {
@@ -126,10 +164,13 @@ impl Future for AmqpStreamNew {
 
     fn poll(&mut self) -> futures::Poll<AmqpStream<TcpStream>, std::io::Error> {
         use futures::Async;
+        use futures::Poll;
         use tokio_core::io;
+        /*
         match self.tcp.poll() {
             Ok(Async::Ready(mut tcp)) => {
-                io::write_all(tcp, &[b'A', b'M', b'Q', b'P', 0, 0, 9, 1])
+                */
+                io::write_all(&mut self.tcp, &[b'A', b'M', b'Q', b'P', 0, 0, 9, 1])
                     .map(|(tcp, _)| AmqpStream {
                         inner: tcp.framed(AmqpCodec {}),
                         frame_max_limit: 131072,
@@ -137,20 +178,24 @@ impl Future for AmqpStreamNew {
                         channels: Vec::new(),
                     })
                     .poll()
-
+/*
                 //Ok(Async::Ready(AmqpStream { inner: tcp.framed(AmqpCodec {}) }))
             },
             Ok(Async::NotReady) => Ok(Async::NotReady),
             Err(e) => Err(e),
         }
+        */
     }
 }
+*/
 
+/*
 impl AmqpStream<TcpStream> {
     pub fn connect(addr: &SocketAddr, handle: &tokio_core::reactor::Handle) -> AmqpStreamNew {
        AmqpStreamNew { tcp: TcpStream::connect(addr, handle) }
     }
 }
+*/
 
 impl<T> Read for AmqpStream<T> where T: tokio_core::io::Io {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -172,29 +217,30 @@ impl<T> Write for AmqpStream<T> where T: tokio_core::io::Io {
 }
 
 impl<T> futures::Stream for AmqpStream<T> where T: tokio_core::io::Io {
-    type Item = Frame;
-    type Error = amqp::AMQPError;
+    type Item = (u64, Frame);
+    type Error = std::io::Error;
 
     fn poll(&mut self) -> futures::Poll<Option<Self::Item>, Self::Error> {
-        self.inner.poll().map_err(|e| AMQPError::IoError(e.kind()))
+        self.inner.poll()
     }
 }
 
 impl<T> futures::Sink for AmqpStream<T> where T: tokio_core::io::Io {
-    type SinkItem = Frame;
-    type SinkError = amqp::AMQPError;
+    type SinkItem = (u64, Frame);
+    type SinkError = std::io::Error;
 
     fn start_send(&mut self,
               item: Self::SinkItem)
               -> futures::StartSend<Self::SinkItem, Self::SinkError> {
-                  self.inner.start_send(item).map_err(|e| AMQPError::IoError(e.kind()))
+                  self.inner.start_send(item)
               }
     fn poll_complete(&mut self) -> futures::Poll<(), Self::SinkError> {
-        self.inner.poll_complete().map_err(|e| AMQPError::IoError(e.kind()))
+        self.inner.poll_complete()
     }
 }
 
 impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
+    /*
     fn tune(self) -> Box<Future<Item = Self, Error = amqp::AMQPError>> {
         let stream = self.into_future().and_then(|(frame, mut stream)| {
             if let Some(ref frame) = frame {
@@ -405,6 +451,7 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
 
         Box::new(f)
     }
+    */
 }
 
 struct AmqpTransport<T> {
@@ -415,6 +462,32 @@ struct AmqpTransport<T> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn amqp_client() {
+        use std::env;
+        use tokio_core::net::TcpStream;
+        use tokio_core::reactor::Core;
+        use tokio_core::io::Io;
+        use tokio_core::io;
+        use std::net::SocketAddr;
+        use std::str::FromStr;
+        use std::io::{Read,Write,Cursor};
+        use futures::{Future,Stream};
+        use futures;
+        use amqp::protocol::{self, Frame, FrameType, MethodFrame, Method};
+        use ::AmqpStream;
+        use amqp;
+
+        let AMQP_VHOST = env::var("AMQP_VHOST").unwrap();
+        let AMQP_LOGIN = env::var("AMQP_LOGIN").unwrap();
+        let AMQP_PASSWORD = env::var("AMQP_PASSWORD").unwrap();
+        let AMQP_QUEUE = env::var("AMQP_QUEUE").unwrap();
+
+        let mut l = Core::new().unwrap();
+        let handle = l.handle();
+
+        let addr = SocketAddr::from_str("192.168.0.222:5672").unwrap();
+    }
+    /*
     fn amqp_stream() {
         use std::env;
         use tokio_core::net::TcpStream;
@@ -467,4 +540,5 @@ mod tests {
         let res = l.run(f).unwrap();
         //println!("RESULT: {:?}", res);
     }
+    */
 }
