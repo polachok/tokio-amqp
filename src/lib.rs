@@ -23,11 +23,9 @@ impl ClientProto<TcpStream> for AmqpClient {
     type Response = Frame;
     type Error = amqp::AMQPError;
     type Transport = AmqpStream<TcpStream>;
-    type BindTransport = Result<AmqpStream<TcpStream>, std::io::Error>;
+    type BindTransport = Box<Future<Item = AmqpStream<TcpStream>, Error = std::io::Error>>;
     fn bind_transport(&self, io: TcpStream) -> Self::BindTransport {
-        //AmqpStreamNew { tcp: io }
-        /*
-        const bytes: [u8; 8] = [b'A', b'M', b'Q', b'P', 0, 0, 9, 1];
+        static bytes: [u8; 8] = [b'A', b'M', b'Q', b'P', 0, 0, 9, 1];
         let f = tokio_core::io::write_all(io, &bytes)
                     .and_then(move |(tcp, _)| Ok(AmqpStream {
                         inner: tcp.framed(AmqpCodec {}),
@@ -36,14 +34,6 @@ impl ClientProto<TcpStream> for AmqpClient {
                         channels: Vec::new(),
                     }));
         Box::new(f)
-                    */
-        //Ok(AmqpStream { inner: io.framed(AmqpCodec {}) })
-        Ok(AmqpStream {
-                        inner: io.framed(AmqpCodec {}),
-                        frame_max_limit: 131072,
-                        channel_max_limit: 65535,
-                        channels: Vec::new(),
-                    })
     }
 }
 
@@ -468,13 +458,14 @@ mod tests {
         use tokio_core::reactor::Core;
         use tokio_core::io::Io;
         use tokio_core::io;
+        use tokio_proto::TcpClient;
         use std::net::SocketAddr;
         use std::str::FromStr;
         use std::io::{Read,Write,Cursor};
         use futures::{Future,Stream};
         use futures;
         use amqp::protocol::{self, Frame, FrameType, MethodFrame, Method};
-        use ::AmqpStream;
+        use ::{AmqpStream,AmqpClient};
         use amqp;
 
         let AMQP_VHOST = env::var("AMQP_VHOST").unwrap();
@@ -486,6 +477,13 @@ mod tests {
         let handle = l.handle();
 
         let addr = SocketAddr::from_str("192.168.0.222:5672").unwrap();
+        let conn = TcpClient::new(AmqpClient{})
+            .connect(&addr, &handle)
+            .and_then(|client| {
+                client.call()
+            });
+        let x = l.run(conn);
+        println!("{:?}", x);
     }
     /*
     fn amqp_stream() {
