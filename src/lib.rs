@@ -2,6 +2,7 @@ extern crate tokio_core;
 extern crate futures;
 extern crate amqp;
 extern crate tokio_proto;
+extern crate tokio_service;
 
 use tokio_core::net::{TcpStream,TcpStreamNew};
 use tokio_core::reactor::Core;
@@ -15,10 +16,65 @@ use futures::{Future,Stream,Sink};
 use amqp::protocol::{self, Frame, FrameType, MethodFrame, Method};
 use amqp::AMQPError;
 use tokio_proto::multiplex::ClientProto;
+use tokio_service::Service;
 
-struct AmqpClient { }
+struct AmqpClient<T> where T: tokio_service::Service {
+    inner: T
+}
 
-impl ClientProto<TcpStream> for AmqpClient {
+impl<T: tokio_service::Service<Request = Frame, Response = Frame, Error = AMQPError> + 'static> AmqpClient<T> {
+    fn conn_start_frame(options: amqp::Options) -> amqp::protocol::connection::StartOk {
+        use amqp::protocol::Table;
+        use amqp::protocol::{FieldTable, Bool, LongString};
+
+        let mut client_properties = Table::new();
+        let mut capabilities = Table::new();
+        capabilities.insert("publisher_confirms".to_owned(), Bool(true));
+        capabilities.insert("consumer_cancel_notify".to_owned(), Bool(true));
+        capabilities.insert("exchange_exchange_bindings".to_owned(), Bool(true));
+        capabilities.insert("basic.nack".to_owned(), Bool(true));
+        capabilities.insert("connection.blocked".to_owned(), Bool(true));
+        capabilities.insert("authentication_failure_close".to_owned(), Bool(true));
+        client_properties.insert("capabilities".to_owned(), FieldTable(capabilities));
+        client_properties.insert("product".to_owned(), LongString("rust-amqp".to_owned()));
+        client_properties.insert("platform".to_owned(), LongString("rust".to_owned()));
+        client_properties.insert("version".to_owned(), LongString("0.0.1".to_owned()));
+        client_properties.insert("information".to_owned(),
+        LongString("https://github.com/Antti/rust-amqp".to_owned()));
+
+        let start_ok = protocol::connection::StartOk {
+            client_properties: client_properties,
+            mechanism: "PLAIN".to_owned(),
+            response: format!("\0{}\0{}", options.login, options.password),
+            locale: options.locale.to_owned(),
+        };
+        start_ok
+    }
+
+    pub fn auth(&self, options: amqp::Options) -> Box<Future<Item = T::Response, Error = T::Error>> {
+        let start_ok = Self::conn_start_frame(options);
+        let start_ok_frame = Frame {
+            frame_type: amqp::protocol::FrameType::METHOD,
+            channel: 0,
+            payload: start_ok.encode_method_frame().unwrap(),
+        };
+
+        let f = self.inner.call(start_ok_frame).and_then(|frame| {
+            let method_frame = try!(MethodFrame::decode(&frame));
+            let start: protocol::connection::Start = match method_frame.method_name() {
+                "connection.start" => try!(protocol::Method::decode(method_frame)),
+                meth => return Err(AMQPError::Protocol(format!("Unexpected method frame: {:?}", meth))),
+            };
+            println!("start {:?}", start);
+            Ok(frame)
+        });
+        Box::new(f)
+    }
+}
+
+struct AmqpProto { }
+
+impl ClientProto<TcpStream> for AmqpProto {
     type Request = Frame;
     type Response = Frame;
     type Error = amqp::AMQPError;
@@ -75,7 +131,9 @@ impl Codec for AmqpCodec {
     }
 
     fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> std::io::Result<()> {
-        let mut v = msg.1.encode().unwrap();
+        let mut frame = msg.1.clone();
+        frame.channel = msg.0 as u16;
+        let mut v = frame.encode().unwrap();
         buf.append(&mut v);
         Ok(())
     }
@@ -459,13 +517,14 @@ mod tests {
         use tokio_core::io::Io;
         use tokio_core::io;
         use tokio_proto::TcpClient;
+        use tokio_service::Service;
         use std::net::SocketAddr;
         use std::str::FromStr;
         use std::io::{Read,Write,Cursor};
         use futures::{Future,Stream};
         use futures;
         use amqp::protocol::{self, Frame, FrameType, MethodFrame, Method};
-        use ::{AmqpStream,AmqpClient};
+        use ::{AmqpStream,AmqpProto,AmqpClient};
         use amqp;
 
         let AMQP_VHOST = env::var("AMQP_VHOST").unwrap();
@@ -477,10 +536,23 @@ mod tests {
         let handle = l.handle();
 
         let addr = SocketAddr::from_str("192.168.0.222:5672").unwrap();
-        let conn = TcpClient::new(AmqpClient{})
+        let conn = TcpClient::new(AmqpProto{})
             .connect(&addr, &handle)
+            .map_err(|e| amqp::AMQPError::IoError(e.kind()))
+            .map(|client| AmqpClient { inner: client })
             .and_then(|client| {
-                client.call()
+                let options = amqp::Options {
+                    host: "127.0.0.1".to_string(),
+                    port: 5672,
+                    vhost: AMQP_VHOST,
+                    login: AMQP_LOGIN,
+                    password: AMQP_PASSWORD,
+                    frame_max_limit: 131072,
+                    channel_max_limit: 65535,
+                    locale: "en_US".to_string(),
+                    scheme: amqp::AMQPScheme::AMQP,
+                };
+                client.auth(options)
             });
         let x = l.run(conn);
         println!("{:?}", x);
