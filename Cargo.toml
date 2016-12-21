@@ -7,5 +7,6 @@ authors = ["Alexander Polyakov <apolyakov@beget.com>"]
 amqp = { git = "https://github.com/polachok/rust-amqp", branch = "public", default-features = false }
 tokio-core = "0.1.1"
 futures = "0.1.6"
-tokio-proto = { git = "https://github.com/tokio-rs/tokio-proto", rev = "8a4ec51cf91cea2e3be426f17fa0a4ed0e431266"}
+tokio-proto = { git = "https://github.com/tokio-rs/tokio-proto", rev = "a839427a42c3b83736776ecb82ed5bb0bc7890e7"}
 tokio-service = { git = "https://github.com/tokio-rs/tokio-service" }
+log = "0.3"

@@ -3,6 +3,7 @@ extern crate futures;
 extern crate amqp;
 extern crate tokio_proto;
 extern crate tokio_service;
+extern crate log;
 
 use tokio_core::net::{TcpStream,TcpStreamNew};
 use tokio_core::reactor::Core;
@@ -18,22 +19,69 @@ use amqp::AMQPError;
 use tokio_proto::multiplex::ClientProto;
 use tokio_service::Service;
 
+use log::{LogRecord, LogLevel, LogMetadata};
+
+struct SimpleLogger;
+
+impl log::Log for SimpleLogger {
+    fn enabled(&self, metadata: &LogMetadata) -> bool {
+        metadata.level() <= LogLevel::Debug
+    }
+
+    fn log(&self, record: &LogRecord) {
+        if self.enabled(record.metadata()) {
+            println!("{} - {}", record.level(), record.args());
+        }
+    }
+}
+
+impl SimpleLogger {
+    pub fn init() -> Result<(), log::SetLoggerError> {
+        log::set_logger(|max_log_level| {
+            max_log_level.set(log::LogLevelFilter::Trace);
+            Box::new(SimpleLogger)
+        })
+    }
+}
+
 struct AmqpClient<T> where T: tokio_service::Service {
     inner: T
 }
 
 impl<T: tokio_service::Service<Request = Frame, Response = Frame, Error = AMQPError> + 'static> AmqpClient<T> {
-    fn test(&self) -> Result<i32, AMQPError> {
-        Ok(1)
-    }
-
-    pub fn open_channel(&mut self, chan: u16) -> T::Future {
+    pub fn open_channel(&mut self, chan: u16) -> Box<Future<Item = Frame, Error = AMQPError>> {
+        println!("OPEN CHANNEL1");
         use amqp::protocol;
         let method = protocol::channel::Open { out_of_band: "".to_owned() };
         let f = Frame {
-                frame_type: amqp::protocol::FrameType::METHOD,
-                channel: 0,
-                payload: method.encode_method_frame().unwrap(),
+            frame_type: amqp::protocol::FrameType::METHOD,
+            channel: chan,
+            payload: method.encode_method_frame().unwrap(),
+        };
+        println!("OPEN CHANNEL2: {:?}", f);
+        let service = &mut self.inner;
+        let f = service.call(f).and_then(|f| {
+            println!("OPEN CHANNEL3 RESP {:?}", f);
+            Ok(f)
+        });
+        Box::new(f)
+    }
+
+    pub fn declare_queue(&mut self, chan: u16, queue: String) -> T::Future {
+        let method = protocol::queue::Declare {
+            ticket: 0,
+            queue: queue.into(),
+            passive: false,
+            durable: true,
+            exclusive: false,
+            auto_delete: false,
+            nowait: false,
+            arguments: amqp::Table::new(),
+        };
+        let f = Frame {
+            frame_type: amqp::protocol::FrameType::METHOD,
+            channel: chan,
+            payload: method.encode_method_frame().unwrap(),
         };
         self.inner.call(f)
     }
@@ -69,7 +117,7 @@ impl ClientProto<TcpStream> for AmqpProto {
                         inner: tcp.framed(AmqpCodec {}),
                         frame_max_limit: 131072,
                         channel_max_limit: 65535,
-                    })).and_then(|stream| stream.auth(options2));
+                    })).and_then(move |stream| stream.auth(options2));
         Box::new(f)
     }
 }
@@ -89,18 +137,15 @@ impl Codec for AmqpCodec {
                 let mut c = Cursor::new(&bytes[0..pos+1]);
                 let f = Frame::decode(&mut c).ok();
                 if let Some(f) = f {
-                    //println!("FRAME {:?}", f);
-                    //let mf = MethodFrame::decode(&f).unwrap();
-                    //println!("METHOD FRAME {:?} name: {}", mf, mf.method_name());
-                    //let met: protocol::connection::Start = Method::decode(mf).unwrap();
-                    //println!("METHOD {:?}", met);
+                    //println!("DECODING FRAME {:?}", f);
+                    let mf = MethodFrame::decode(&f).unwrap();
+                    println!("Decoding method frame {}", mf.method_name());
                     Some((pos, Some((f.channel as u64, f))))
                 } else {
                     None
                 }
                 //Some((pos, f))
             } else {
-                //println!("NOTHING IN HERE");
                 None
             }
         };
@@ -113,7 +158,8 @@ impl Codec for AmqpCodec {
 
     fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> std::io::Result<()> {
         let mut frame = msg.1.clone();
-        frame.channel = msg.0 as u16;
+        //frame.channel = msg.0 as u16;
+        println!("ENCODING MSG {:?}", msg.1);
         let mut v = frame.encode().unwrap();
         buf.append(&mut v);
         Ok(())
@@ -248,7 +294,7 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
                             "connection.open-ok" => try!(protocol::Method::decode(method_frame)),
                             meth => return Err(AMQPError::Protocol(format!("Unexpected method frame: {:?}", meth))),
                         };
-                        println!("GOT FRAME {:?}", open_ok);
+                        println!("Received connection open-ok");
                     }
                     Ok(stream)
                 })().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
@@ -257,7 +303,7 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
         Box::new(stream)
     }
 
-    pub fn auth(mut self, options: amqp::Options) -> Box<Future<Item = Self, Error = std::io::Error>> {
+    pub fn auth(self, options: amqp::Options) -> Box<Future<Item = Self, Error = std::io::Error>> {
         use amqp::Options;
 
         fn conn_start_frame(options: amqp::Options) -> amqp::protocol::connection::StartOk {
@@ -443,6 +489,7 @@ mod tests {
         use futures;
         use amqp::protocol::{self, Frame, FrameType, MethodFrame, Method};
         use ::{AmqpStream,AmqpProto,AmqpClient};
+        use ::SimpleLogger;
         use amqp;
 
         let AMQP_VHOST = env::var("AMQP_VHOST").unwrap();
@@ -450,6 +497,7 @@ mod tests {
         let AMQP_PASSWORD = env::var("AMQP_PASSWORD").unwrap();
         let AMQP_QUEUE = env::var("AMQP_QUEUE").unwrap();
 
+        SimpleLogger::init();
         let mut l = Core::new().unwrap();
         let handle = l.handle();
         let options = amqp::Options {
@@ -465,17 +513,29 @@ mod tests {
                 };
 
         let addr = SocketAddr::from_str("192.168.0.222:5672").unwrap();
-        let conn = TcpClient::new(AmqpProto{
+        let mut client = TcpClient::new(AmqpProto{
                 options: options
             })
             .connect(&addr, &handle)
             .map_err(|e| amqp::AMQPError::IoError(e.kind()))
-            .map(|client| AmqpClient { inner: client })
-            .and_then(|mut client| {
-                client.open_channel(1)
-            });
-        let x = l.run(conn);
-        println!("{:?}", x);
+            .map(move |client| AmqpClient { inner: client })
+            .and_then(move |mut client| 
+                client.open_channel(1).and_then(|_| Ok(client)) // .and_then(move |_| client.declare_queue(1, "test1488".to_owned()))
+            );
+
+        let frame = l.run(&mut client).unwrap();
+        /*
+        let method_frame = MethodFrame::decode(&frame).unwrap();
+        println!("{:?} METHOD: {:?}", frame, method_frame.method_name());
+        match method_frame.method_name() {
+            "connection.close" => {
+                println!("CONNECTION CLOSE");
+                let met: protocol::connection::Close = Method::decode(method_frame).unwrap();
+                println!("{:?}", met);
+            },
+            _ => println!("other"),
+        }
+        */
     }
     /*
     fn amqp_stream() {
