@@ -41,7 +41,7 @@ impl<T: tokio_service::Service<Request = Frame, Response = Frame, Error = AMQPEr
 
 struct AmqpProto {
     options: amqp::Options,
- }
+}
 
 impl ClientProto<TcpStream> for AmqpProto {
     type Request = Frame;
@@ -270,25 +270,59 @@ impl<T> futures::Sink for AmqpStream<T> where T: tokio_core::io::Io {
 }
 
 impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
-    /*
+    fn do_write<S: Sink<SinkItem = (u64, Frame), SinkError = std::io::Error>>(sink: S, frame: (u64, Frame))
+        -> futures::sink::Send<S> {
+        let frame_max_limit = 131072;
+        /*match frame.frame_type {
+                /*
+            FrameType::BODY => {
+                // TODO: Check if need to include frame header + end octet into calculation. (9
+                // bytes extra)
+                for content_frame in Self::split_content_into_frames(frame.payload,
+                                                               frame_max_limit)
+                    .into_iter() {
+                    sink.send(Frame {
+                        frame_type: frame.frame_type,
+                        channel: frame.channel,
+                        payload: content_frame,
+                    })
+                }
+            }
+                */
+            _ => sink.send(frame)
+        }
+        */
+        sink.send(frame)
+    }
+
+    fn send_method_frame<M, S>(sink: S, chan_id: u16, method: &M) -> futures::sink::Send<S>
+        where M: amqp::protocol::Method, S: Sink<SinkItem = (u64, Frame), SinkError = std::io::Error>
+        {
+            println!("Sending method {} to channel {}", method.name(), chan_id);
+            Self::do_write(sink, (chan_id as u64, Frame {
+                frame_type: amqp::protocol::FrameType::METHOD,
+                channel: chan_id,
+                payload: method.encode_method_frame().unwrap(),
+            }))
+        }
+
     fn tune(self) -> Box<Future<Item = Self, Error = std::io::Error>> {
-        let stream = self.into_future().and_then(|(frame, mut stream)| {
+        let stream = self.into_future().map_err(|(e, _)| e).and_then(|(frame, mut stream)| (move || {
             if let Some(ref frame) = frame {
+                let ref frame = frame.1;
                 let method_frame = MethodFrame::decode(&frame).unwrap();
                 let tune: protocol::connection::Tune = match method_frame.method_name() {
                     "connection.tune" => protocol::Method::decode(method_frame).unwrap(),
                     "connection.close" => panic!("CLOSE RECEIVED"),
-                    meth => panic!("wtf"), // return Err(AMQPError::Protocol(format!("Unexpected method frame: {:?}", meth))),
+                    meth => return Err(AMQPError::Protocol(format!("Unexpected method frame: {:?}", meth))),
                 };
                 println!("tune {:?}", tune);
                 stream.channel_max_limit = std::cmp::min(tune.channel_max, stream.channel_max_limit);
                 stream.frame_max_limit = std::cmp::min(tune.frame_max, stream.frame_max_limit);
             }
-            //Ok((sink, stream))
             Ok(stream)
-        }).map_err(|(e, _)| {
-            e
-        });
+        })().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        );
 
         let stream = stream.and_then(|stream| {
             let tune_ok = protocol::connection::TuneOk {
@@ -297,7 +331,7 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
                 heartbeat: 60,
             };
             println!("SENDING TUNE OK");
-            Channel::send_method_frame(stream, 0, &tune_ok)
+            Self::send_method_frame(stream, 0, &tune_ok)
             .and_then(|stream| {
                 let open = protocol::connection::Open {
                     virtual_host: "vm-apolyakov".to_owned(), //percent_decode(&options.vhost),
@@ -305,10 +339,11 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
                     insist: false,
                 };
                 println!("Sending connection.open: {:?}", open);
-                Channel::send_method_frame(stream, 0, &open)
+                Self::send_method_frame(stream, 0, &open)
             }).and_then(|stream| {
-                stream.into_future().map_err(|(e, _)| e).and_then(|(frame, stream)| {
+                stream.into_future().map_err(|(e, _)| e).and_then(|(frame, stream)| (move || {
                     if let Some(ref frame) = frame {
+                        let ref frame = frame.1;
                         let method_frame = try!(MethodFrame::decode(&frame));
                         let open_ok: protocol::connection::OpenOk = match method_frame.method_name() {
                             "connection.open-ok" => try!(protocol::Method::decode(method_frame)),
@@ -317,11 +352,11 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
                         println!("GOT FRAME {:?}", open_ok);
                     }
                     Ok(stream)
-                })
+                })().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+              )
             })});
         Box::new(stream)
     }
-    */
 
     pub fn auth(mut self, options: amqp::Options) -> Box<Future<Item = Self, Error = std::io::Error>> {
         use amqp::Options;
@@ -370,13 +405,13 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
             Ok(stream)
         })().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         );
-/*
+
         let stream = stream.and_then(|stream| {
-            Channel::send_method_frame(stream, 0, &conn_start_frame(options))
+            Self::send_method_frame(stream, 0, &conn_start_frame(options))
         }).and_then(|stream| {
             stream.tune()
         });
-        */
+
         //let stream = stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
         Box::new(stream)
     }
