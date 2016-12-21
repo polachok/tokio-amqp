@@ -23,72 +23,54 @@ struct AmqpClient<T> where T: tokio_service::Service {
 }
 
 impl<T: tokio_service::Service<Request = Frame, Response = Frame, Error = AMQPError> + 'static> AmqpClient<T> {
-    fn conn_start_frame(options: amqp::Options) -> amqp::protocol::connection::StartOk {
-        use amqp::protocol::Table;
-        use amqp::protocol::{FieldTable, Bool, LongString};
-
-        let mut client_properties = Table::new();
-        let mut capabilities = Table::new();
-        capabilities.insert("publisher_confirms".to_owned(), Bool(true));
-        capabilities.insert("consumer_cancel_notify".to_owned(), Bool(true));
-        capabilities.insert("exchange_exchange_bindings".to_owned(), Bool(true));
-        capabilities.insert("basic.nack".to_owned(), Bool(true));
-        capabilities.insert("connection.blocked".to_owned(), Bool(true));
-        capabilities.insert("authentication_failure_close".to_owned(), Bool(true));
-        client_properties.insert("capabilities".to_owned(), FieldTable(capabilities));
-        client_properties.insert("product".to_owned(), LongString("rust-amqp".to_owned()));
-        client_properties.insert("platform".to_owned(), LongString("rust".to_owned()));
-        client_properties.insert("version".to_owned(), LongString("0.0.1".to_owned()));
-        client_properties.insert("information".to_owned(),
-        LongString("https://github.com/Antti/rust-amqp".to_owned()));
-
-        let start_ok = protocol::connection::StartOk {
-            client_properties: client_properties,
-            mechanism: "PLAIN".to_owned(),
-            response: format!("\0{}\0{}", options.login, options.password),
-            locale: options.locale.to_owned(),
-        };
-        start_ok
+    fn test(&self) -> Result<i32, AMQPError> {
+        Ok(1)
     }
 
-    pub fn auth(&self, options: amqp::Options) -> Box<Future<Item = T::Response, Error = T::Error>> {
-        let start_ok = Self::conn_start_frame(options);
-        let start_ok_frame = Frame {
-            frame_type: amqp::protocol::FrameType::METHOD,
-            channel: 0,
-            payload: start_ok.encode_method_frame().unwrap(),
+    pub fn open_channel(&mut self, chan: u16) -> T::Future {
+        use amqp::protocol;
+        let method = protocol::channel::Open { out_of_band: "".to_owned() };
+        let f = Frame {
+                frame_type: amqp::protocol::FrameType::METHOD,
+                channel: 0,
+                payload: method.encode_method_frame().unwrap(),
         };
-
-        let f = self.inner.call(start_ok_frame).and_then(|frame| {
-            let method_frame = try!(MethodFrame::decode(&frame));
-            let start: protocol::connection::Start = match method_frame.method_name() {
-                "connection.start" => try!(protocol::Method::decode(method_frame)),
-                meth => return Err(AMQPError::Protocol(format!("Unexpected method frame: {:?}", meth))),
-            };
-            println!("start {:?}", start);
-            Ok(frame)
-        });
-        Box::new(f)
+        self.inner.call(f)
     }
 }
 
-struct AmqpProto { }
+struct AmqpProto {
+    options: amqp::Options,
+ }
 
 impl ClientProto<TcpStream> for AmqpProto {
     type Request = Frame;
     type Response = Frame;
     type Error = amqp::AMQPError;
     type Transport = AmqpStream<TcpStream>;
-    type BindTransport = Box<Future<Item = AmqpStream<TcpStream>, Error = std::io::Error>>;
+    type BindTransport = Box<Future<Item = Self::Transport, Error = std::io::Error>>;
     fn bind_transport(&self, io: TcpStream) -> Self::BindTransport {
         static bytes: [u8; 8] = [b'A', b'M', b'Q', b'P', 0, 0, 9, 1];
+        let options2 = amqp::Options {
+                    host: self.options.host.clone(),
+                    port: self.options.port.clone(),
+                    vhost: self.options.vhost.clone(),
+                    login: self.options.login.clone(),
+                    password: self.options.password.clone(),
+                    frame_max_limit: self.options.frame_max_limit.clone(),
+                    channel_max_limit: 65535,
+                    locale: self.options.locale.clone(),
+                    scheme: amqp::AMQPScheme::AMQP,
+                };
+
+
         let f = tokio_core::io::write_all(io, &bytes)
                     .and_then(move |(tcp, _)| Ok(AmqpStream {
                         inner: tcp.framed(AmqpCodec {}),
                         frame_max_limit: 131072,
                         channel_max_limit: 65535,
                         channels: Vec::new(),
-                    }));
+                    })).and_then(|stream| stream.auth(options2));
         Box::new(f)
     }
 }
@@ -289,7 +271,7 @@ impl<T> futures::Sink for AmqpStream<T> where T: tokio_core::io::Io {
 
 impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
     /*
-    fn tune(self) -> Box<Future<Item = Self, Error = amqp::AMQPError>> {
+    fn tune(self) -> Box<Future<Item = Self, Error = std::io::Error>> {
         let stream = self.into_future().and_then(|(frame, mut stream)| {
             if let Some(ref frame) = frame {
                 let method_frame = MethodFrame::decode(&frame).unwrap();
@@ -339,8 +321,9 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
             })});
         Box::new(stream)
     }
+    */
 
-    pub fn auth(mut self, options: amqp::Options) -> Box<Future<Item = Self, Error = amqp::AMQPError>> {
+    pub fn auth(mut self, options: amqp::Options) -> Box<Future<Item = Self, Error = std::io::Error>> {
         use amqp::Options;
 
         let chan0 = Channel { id: 0 };
@@ -374,8 +357,9 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
             start_ok
         }
 
-        let stream = self.into_future().map_err(|(e, _)| e).and_then(|(frame, stream)| {
+        let stream = self.into_future().map_err(|(e, _)| e).and_then(|(frame, stream)| (move || {
             if let Some(ref frame) = frame {
+                let ref frame = frame.1;
                 let method_frame = try!(MethodFrame::decode(&frame));
                 let start: protocol::connection::Start = match method_frame.method_name() {
                     "connection.start" => try!(protocol::Method::decode(method_frame)),
@@ -384,16 +368,19 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
                 println!("start {:?}", start);
             }
             Ok(stream)
-        });
-
+        })().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        );
+/*
         let stream = stream.and_then(|stream| {
             Channel::send_method_frame(stream, 0, &conn_start_frame(options))
         }).and_then(|stream| {
             stream.tune()
         });
+        */
+        //let stream = stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
         Box::new(stream)
     }
-
+/*
     pub fn channel_open(mut self) -> Box<Future<Item = Self, Error = amqp::AMQPError>> {
         let open = protocol::channel::Open { out_of_band: "".to_owned() };
         let chan_id = self.channels.len() as u16;
@@ -534,14 +521,7 @@ mod tests {
 
         let mut l = Core::new().unwrap();
         let handle = l.handle();
-
-        let addr = SocketAddr::from_str("192.168.0.222:5672").unwrap();
-        let conn = TcpClient::new(AmqpProto{})
-            .connect(&addr, &handle)
-            .map_err(|e| amqp::AMQPError::IoError(e.kind()))
-            .map(|client| AmqpClient { inner: client })
-            .and_then(|client| {
-                let options = amqp::Options {
+        let options = amqp::Options {
                     host: "127.0.0.1".to_string(),
                     port: 5672,
                     vhost: AMQP_VHOST,
@@ -552,7 +532,16 @@ mod tests {
                     locale: "en_US".to_string(),
                     scheme: amqp::AMQPScheme::AMQP,
                 };
-                client.auth(options)
+
+        let addr = SocketAddr::from_str("192.168.0.222:5672").unwrap();
+        let conn = TcpClient::new(AmqpProto{
+                options: options
+            })
+            .connect(&addr, &handle)
+            .map_err(|e| amqp::AMQPError::IoError(e.kind()))
+            .map(|client| AmqpClient { inner: client })
+            .and_then(|mut client| {
+                client.open_channel(1)
             });
         let x = l.run(conn);
         println!("{:?}", x);
