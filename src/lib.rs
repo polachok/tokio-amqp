@@ -69,7 +69,6 @@ impl ClientProto<TcpStream> for AmqpProto {
                         inner: tcp.framed(AmqpCodec {}),
                         frame_max_limit: 131072,
                         channel_max_limit: 65535,
-                        channels: Vec::new(),
                     })).and_then(|stream| stream.auth(options2));
         Box::new(f)
     }
@@ -121,111 +120,11 @@ impl Codec for AmqpCodec {
     }
 }
 
-#[derive(Debug)]
-struct Channel {
-    id: u16,
-}
-
-impl Channel {
-    fn split_content_into_frames(content: Vec<u8>, frame_limit: u32) -> Vec<Vec<u8>> {
-        use std::cmp;
-        assert!(frame_limit > 0, "Can't have frame_max_limit == 0");
-        let mut content_frames = vec![];
-        let mut current_pos = 0;
-        while current_pos < content.len() {
-            let new_pos = current_pos + cmp::min(content.len() - current_pos, frame_limit as usize);
-            content_frames.push(content[current_pos..new_pos].to_vec());
-            current_pos = new_pos;
-        }
-        content_frames
-    }
-
-    fn do_write<S: Sink<SinkItem = Frame, SinkError = amqp::AMQPError>>(sink: S, frame: Frame)
-        -> futures::sink::Send<S> {
-        let frame_max_limit = 131072;
-        println!("FRAMETYPE {:?}", frame.frame_type);
-        match frame.frame_type {
-                /*
-            FrameType::BODY => {
-                // TODO: Check if need to include frame header + end octet into calculation. (9
-                // bytes extra)
-                for content_frame in Self::split_content_into_frames(frame.payload,
-                                                               frame_max_limit)
-                    .into_iter() {
-                    sink.send(Frame {
-                        frame_type: frame.frame_type,
-                        channel: frame.channel,
-                        payload: content_frame,
-                    })
-                }
-            }
-                */
-            _ => sink.send(frame),
-        }
-    }
-
-    pub fn send_method_frame<M, S>(sink: S, chan_id: u16, method: &M) -> futures::sink::Send<S>
-        where M: amqp::protocol::Method, S: Sink<SinkItem = Frame, SinkError = amqp::AMQPError>
-        {
-            println!("Sending method {} to channel {}", method.name(), chan_id);
-            Self::do_write(sink, Frame {
-                frame_type: amqp::protocol::FrameType::METHOD,
-                channel: chan_id,
-                payload: method.encode_method_frame().unwrap(),
-            })
-        }
-}
-
 struct AmqpStream<T: tokio_core::io::Io> {
     inner: Framed<T, AmqpCodec>,
     channel_max_limit: u16,
     frame_max_limit: u32,
-    channels: Vec<Channel>,
 }
-
-/*
-struct AmqpStreamNew {
-    tcp: TcpStream,
-}
-
-impl Future for AmqpStreamNew {
-    type Item = AmqpStream<TcpStream>;
-    type Error = std::io::Error;
-
-    fn poll(&mut self) -> futures::Poll<AmqpStream<TcpStream>, std::io::Error> {
-        use futures::Async;
-        use futures::Poll;
-        use tokio_core::io;
-        /*
-        match self.tcp.poll() {
-            Ok(Async::Ready(mut tcp)) => {
-                */
-                io::write_all(&mut self.tcp, &[b'A', b'M', b'Q', b'P', 0, 0, 9, 1])
-                    .map(|(tcp, _)| AmqpStream {
-                        inner: tcp.framed(AmqpCodec {}),
-                        frame_max_limit: 131072,
-                        channel_max_limit: 65535,
-                        channels: Vec::new(),
-                    })
-                    .poll()
-/*
-                //Ok(Async::Ready(AmqpStream { inner: tcp.framed(AmqpCodec {}) }))
-            },
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(e) => Err(e),
-        }
-        */
-    }
-}
-*/
-
-/*
-impl AmqpStream<TcpStream> {
-    pub fn connect(addr: &SocketAddr, handle: &tokio_core::reactor::Handle) -> AmqpStreamNew {
-       AmqpStreamNew { tcp: TcpStream::connect(addr, handle) }
-    }
-}
-*/
 
 impl<T> Read for AmqpStream<T> where T: tokio_core::io::Io {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -360,9 +259,6 @@ impl<T> AmqpStream<T> where T: tokio_core::io::Io + 'static {
 
     pub fn auth(mut self, options: amqp::Options) -> Box<Future<Item = Self, Error = std::io::Error>> {
         use amqp::Options;
-
-        let chan0 = Channel { id: 0 };
-        self.channels.push(chan0);
 
         fn conn_start_frame(options: amqp::Options) -> amqp::protocol::connection::StartOk {
             use amqp::protocol::Table;
